@@ -7,14 +7,17 @@ class Settings(BaseSettings):
     LOG_DIR: str = "log"
 
     EMBEDDING_MODEL_NAMES: List[str] = [
-        "intfloat/multilingual-e5-base",
-        "ai-forever/sbert_large_mt_nlu_ru",
-        "Qwen/Qwen3-Embedding-4B"
+        "ai-forever/FRIDA",
+        "google/embeddinggemma-300m",
+        "Qwen/Qwen3-Embedding-0.6B"
     ]
 
-    LLM_MODEL_NAME: str = "Qwen/Qwen3-8B"
+    LLM_MODEL_NAME: str = "Qwen/Qwen3-8B-AWQ"
+    # LLM_MODEL_NAME: str = "Qwen/Qwen3-4B-Instruct-2507"
 
     VLLM_URL: str = "http://localhost:8080"
+
+    CACHE_DIR: str = "models"
 
     class Config:
         env_file = ".env"

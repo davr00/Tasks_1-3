@@ -1,18 +1,17 @@
-import time
-import torch
+import asyncio
 from typing import Optional, List
 from uuid import UUID
 
-from langdetect import detect
-from fastapi import FastAPI, HTTPException, Header
+import torch
+from langdetect import detect, LangDetectException
+from fastapi import FastAPI, HTTPException, Header, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse, JSONResponse
 
-from app.src.embedding import get_models, get_embedding, cosine_similarity, angular_similarity
+from app.src.embedding import get_models, get_embedding
 from app.src.llm_service.prompts import normalize_text
 from app.logger import logger
-from app.src.preprocess_text import decode_base64_text, encode_base64_text
-from app.schema import NormalizeRequest, NormalizeResponse, EmbeddingRequest, EmbeddingResponse, ModelResponse
+from app.schema import EmbeddingResponse, ModelResponse
 
 app = FastAPI()
 app.add_middleware(
@@ -23,50 +22,99 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+MAX_QUEUE_SIZE = 3
+queue = asyncio.Queue(MAX_QUEUE_SIZE)
+MAX_TEXT_SIZE = 10 * 1024 * 1024
 
-@app.get("/models", response_model=List[ModelResponse])
+
+
+
+@app.get("/api/models", response_model=List[ModelResponse])
 def list_models():
     try:
+        logger.debug("Получение списка моделей")
         model_registry = get_models()
+        logger.debug(f"Модели: {len(model_registry)}")
+        torch.cuda.empty_cache()
+
         return [
-            {"model_id": model_id, "model_name": model_name}
+            {"model_id": model_id, "model_name": model_name[0], "dimension": model_name[1]}
             for model_id, model_name in model_registry.items()
         ]
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Ошибка при получении списка моделей: {e}")
 
 
-@app.post("/api/normalize", response_model=NormalizeResponse)
-async def normalize(request: NormalizeRequest):
+@app.post("/api/normalize", response_class=PlainTextResponse)
+async def normalize(text: str = Body(..., media_type="text/plain")):
+    logger.info(f"Запрос на нормализацию. Текущая очередь: {queue.qsize()}/{MAX_QUEUE_SIZE}")
+
+    if queue.full():
+        logger.exception("Очередь переполнена. Возвращаем 429")
+        raise HTTPException(status_code=429, detail="Слишком много запросов. Попробуйте позже.")
+
+    if len(text.encode("utf-8")) > MAX_TEXT_SIZE:
+        logger.exception(f"Превышен лимит текста ({len(text.encode('utf-8'))} байт > {MAX_TEXT_SIZE})")
+        raise HTTPException(
+            status_code=413,
+            detail="Payload Too Large: текст превышает допустимый размер 10MB"
+        )
+
+    fut = asyncio.get_event_loop().create_future()
+    await queue.put(fut)
+
     try:
-        original_text = decode_base64_text(request.text)
-        normalized_text = normalize_text(original_text)
+        text.encode("utf-8")
+        normalized_text = await normalize_text(text)
+        logger.info(f"Нормализация завершена. Очередь после выполнения: {queue.qsize()}/{MAX_QUEUE_SIZE}")
+        torch.cuda.empty_cache()
 
         try:
             lang = detect(normalized_text)
-        except Exception:
+        except LangDetectException:
             lang = "und"
 
-        result = NormalizeResponse(
-            normalized_text=encode_base64_text(normalized_text)
-        )
-
         return PlainTextResponse(
-            content=result.model_dump_json(),
+            content=normalized_text,
             media_type="text/plain; charset=utf-8",
             headers={"language": lang}
         )
 
+    except UnicodeEncodeError:
+        logger.exception("Неподдерживаемая кодировка входного текста")
+        raise HTTPException(
+            status_code=400,
+            detail="INVALID_ENCODING: неподдерживаемая кодировка. Ожидается UTF-8."
+        )
     except HTTPException as e:
         raise e
     except Exception:
         logger.exception("Ошибка сервера при нормализации текста")
         raise HTTPException(status_code=500, detail="Internal server error")
+    finally:
+        await queue.get()
+        queue.task_done()
 
 
 @app.post("/api/embedding", response_model=EmbeddingResponse)
-def embedding(request: EmbeddingRequest, model_id: Optional[UUID] = Header(None, alias="model-id")):
+async def embedding(
+        text: str = Body(..., media_type="text/plain"),
+        model_id: Optional[UUID] = Header(None, alias="x-model-id")
+):
+    logger.info(f"Запрос на эмбеддинг. Текущая очередь: {queue.qsize()}/{MAX_QUEUE_SIZE}")
+
+    if queue.full():
+        raise HTTPException(
+            status_code=429,
+            detail="Слишком много запросов. Попробуйте позже."
+        )
+
+    fut = asyncio.get_event_loop().create_future()
+    await queue.put(fut)
+
     try:
+        logger.info(f"Text: {text[:100]}...")
+        logger.info(f"model_id: {model_id}")
         model_registry = get_models()
 
         if model_id is None:
@@ -79,34 +127,16 @@ def embedding(request: EmbeddingRequest, model_id: Optional[UUID] = Header(None,
         if model_id not in model_registry:
             raise HTTPException(status_code=404, detail=f"Model {model_id} not found")
 
-        b64_text1 = request.text1
-        b64_text2 = request.text2
-
-        original_text1 = decode_base64_text(b64_text1)
-        normalized_text1 = normalize_text(original_text1)
-
-        original_text2 = decode_base64_text(b64_text2)
-        normalized_text2 = normalize_text(original_text2)
-
-        texts = [normalized_text1, normalized_text2]
-
-        vectors = get_embedding(model_id, texts)
-
-        emb1 = vectors[0]
-        emb2 = vectors[1]
-
-        cos_sim = cosine_similarity(emb1, emb2)
-        ang_sim = angular_similarity(emb1, emb2)
+        normalized_text = await normalize_text(text)
+        logger.info(f"Нормализация завершена. Очередь после выполнения: {queue.qsize()}/{MAX_QUEUE_SIZE}")
+        torch.cuda.empty_cache()
+        emb, dim = get_embedding(model_id, normalized_text)
+        torch.cuda.empty_cache()
 
         result = EmbeddingResponse(
-            embedding1=emb1,
-            embedding2=emb2,
-            cosine_similarity=cos_sim,
-            angular_similarity_radians=ang_sim,
-            developer_value=None
+            embeddings=emb,
+            dimension=dim
         )
-
-        torch.cuda.empty_cache()
 
         return JSONResponse(
             content=result.model_dump(),
@@ -118,3 +148,6 @@ def embedding(request: EmbeddingRequest, model_id: Optional[UUID] = Header(None,
     except Exception:
         logger.exception("Ошибка сервера при обработке запроса /embedding")
         raise HTTPException(status_code=500, detail="Internal server error")
+    finally:
+        await queue.get()
+        queue.task_done()

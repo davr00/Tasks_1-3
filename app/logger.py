@@ -11,7 +11,8 @@ class ColoredFormatter(logging.Formatter):
         "WARNING": "\033[93m",
         "ERROR": "\033[91m",
         "CRITICAL": "\033[41m",
-        "RESET": "\033[0m"
+        "EXCEPTION": "\033[95m",
+        "RESET": "\033[0m",
     }
 
     def format(self, record):
