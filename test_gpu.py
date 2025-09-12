@@ -9,6 +9,9 @@ from pynvml import (
     nvmlDeviceGetCount,
     nvmlShutdown,
 )
+import torch
+print(torch.version.cuda)
+print(torch.cuda.is_available())
 
 def clear_terminal_lines(n: int):
     for _ in range(n):
